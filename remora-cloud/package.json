@@ -1,0 +1,13 @@
+{
+  "name": "remora-cloud",
+  "version": "1.0.0",
+  "description": "Unified 24/7 cloud server for Remora Development — parcel audit, freight broker, RFP responder, lead enrichment",
+  "type": "module",
+  "main": "src/unified-server.js",
+  "scripts": {
+    "start": "node src/unified-server.js"
+  },
+  "dependencies": {
+    "express": "^4.22.2"
+  }
+}
