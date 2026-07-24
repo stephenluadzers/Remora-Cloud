@@ -14,6 +14,9 @@ import express from "express";
 import { writeFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
+import { initStore } from "./store.js";
+import { requireApiKey, requireAdmin } from "./auth.js";
+import { isStripeConfigured, invoiceLedgerEntries } from "./billing.js";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -28,13 +31,22 @@ const QUEUE_DIR = join(DATA_DIR, "queue");
 const REPORTS_DIR = join(DATA_DIR, "reports");
 [QUEUE_DIR, REPORTS_DIR].forEach((d) => { if (!existsSync(d)) mkdirSync(d, { recursive: true }); });
 
+const store = initStore(DATA_DIR);
+const apiKeyAuth = requireApiKey(store);
+
+// Pricing knobs for the billing ledger — override via env if needed.
+const PARCEL_CONTINGENCY_RATE = parseFloat(process.env.PARCEL_CONTINGENCY_RATE || "0.20");
+const FREIGHT_COMMISSION_RATE = 0.12; // mirrors brokerMargin below
+const RFP_FLAT_FEE = parseFloat(process.env.RFP_FLAT_FEE || "500");
+const LEAD_PRICE = parseFloat(process.env.LEAD_PRICE || "2");
+
 // ============================================
 // HEALTH CHECK
 // ============================================
 app.get("/health", (req, res) => res.json({
   status: "ok",
   service: "remora-cloud",
-  engines: ["parcel", "freight", "rfp"],
+  engines: ["parcel", "freight", "rfp", "leads"],
   uptime: process.uptime(),
   timestamp: new Date().toISOString(),
 }));
@@ -115,7 +127,7 @@ function auditInvoice(record, carrier) {
 }
 
 // Parcel routes
-app.post("/parcel/audit", (req, res) => {
+app.post("/parcel/audit", apiKeyAuth, (req, res) => {
   const { invoices, carrier } = req.body;
   if (!invoices?.length) return res.status(400).json({ error: "invoices array required" });
   
@@ -130,14 +142,23 @@ app.post("/parcel/audit", (req, res) => {
   });
 });
 
-app.post("/parcel/claims/generate", (req, res) => {
+app.post("/parcel/claims/generate", apiKeyAuth, (req, res) => {
   const { tracking_number, carrier, finding, claimant_info } = req.body;
-  
+
   const claimLetter = generateClaimLetter(tracking_number, carrier, finding, claimant_info);
   const claimPath = join(REPORTS_DIR, `claim_${tracking_number}_${Date.now()}.txt`);
   writeFileSync(claimPath, claimLetter);
-  
-  res.json({ generated: true, letter: claimLetter, path: claimPath });
+
+  // Contingency fee is only actually owed once the carrier pays the refund,
+  // so this is logged as a pending ledger entry, not invoiced immediately.
+  const ledgerEntry = store.appendLedgerEntry({
+    client_id: req.client.id,
+    engine: "parcel",
+    description: `Contingency fee on claim ${tracking_number} (${finding?.type || "finding"})`,
+    amount: parseFloat(((finding?.refund_estimate || 0) * PARCEL_CONTINGENCY_RATE).toFixed(2)),
+  });
+
+  res.json({ generated: true, letter: claimLetter, path: claimPath, ledger_entry: ledgerEntry });
 });
 
 function generateClaimLetter(tracking, carrier, finding, info) {
@@ -171,7 +192,7 @@ Remora Development LLC
 stephen@remora-development.com`;
 }
 
-app.get("/parcel/reports", (req, res) => {
+app.get("/parcel/reports", apiKeyAuth, (req, res) => {
   const files = readdirSync(REPORTS_DIR).filter(f => f.startsWith("claim_"));
   res.json({ reports: files.length, files });
 });
@@ -277,14 +298,14 @@ async function screenCarrierFMCSA(usdotOrMC) {
 }
 
 // Freight routes
-app.post("/freight/screen-carrier", async (req, res) => {
+app.post("/freight/screen-carrier", apiKeyAuth, async (req, res) => {
   const { usdot, mc_number } = req.body;
   if (!usdot && !mc_number) return res.status(400).json({ error: "usdot or mc_number required" });
   const result = await screenCarrierFMCSA(usdot || mc_number);
   res.json(result);
 });
 
-app.post("/freight/match", (req, res) => {
+app.post("/freight/match", apiKeyAuth, (req, res) => {
   const { loads, carriers } = req.body;
   if (!loads?.length || !carriers?.length) return res.status(400).json({ error: "loads and carriers required" });
   
@@ -311,7 +332,7 @@ app.post("/freight/match", (req, res) => {
       const distance = getDistance(load.origin_state, load.dest_state);
       const marketRate = MARKET_RATES[load.equipment_type] || MARKET_RATES.other;
       const estimatedRate = distance * marketRate;
-      const brokerMargin = 0.12;
+      const brokerMargin = FREIGHT_COMMISSION_RATE;
       
       let score = 50;
       if (carrier.safety_rating?.toLowerCase().includes("satisfactory")) score += 20;
@@ -335,7 +356,7 @@ app.post("/freight/match", (req, res) => {
   res.json({ matched: matches.length, top_matches: matches.slice(0, 10) });
 });
 
-app.post("/freight/rate-confirm", (req, res) => {
+app.post("/freight/rate-confirm", apiKeyAuth, (req, res) => {
   const { match, load, carrier } = req.body;
   const conf = {
     confirmation_number: `RC-${Date.now().toString().slice(-8)}`,
@@ -350,7 +371,16 @@ app.post("/freight/rate-confirm", (req, res) => {
     status: "PENDING_CARRIER_ACCEPTANCE",
   };
   writeFileSync(join(REPORTS_DIR, `${conf.confirmation_number}.json`), JSON.stringify(conf, null, 2));
-  res.json(conf);
+
+  // Commission is earned on delivery, so this is logged pending rather than invoiced now.
+  const ledgerEntry = store.appendLedgerEntry({
+    client_id: req.client.id,
+    engine: "freight",
+    description: `Broker commission on ${conf.confirmation_number} (${load.origin_city}, ${load.origin_state} -> ${load.dest_city}, ${load.dest_state})`,
+    amount: parseFloat((match.broker_commission || 0).toFixed(2)),
+  });
+
+  res.json({ ...conf, ledger_entry: ledgerEntry });
 });
 
 // ============================================
@@ -387,7 +417,7 @@ function matchCapabilities(rfpText) {
   return matches.sort((a, b) => b.score - a.score);
 }
 
-app.post("/rfp/parse", (req, res) => {
+app.post("/rfp/parse", apiKeyAuth, (req, res) => {
   const { rfp_text } = req.body;
   if (!rfp_text) return res.status(400).json({ error: "rfp_text required" });
   
@@ -415,9 +445,9 @@ app.post("/rfp/parse", (req, res) => {
   res.json(parsed);
 });
 
-app.post("/rfp/generate", (req, res) => {
+app.post("/rfp/generate", apiKeyAuth, (req, res) => {
   const { rfp_data, capabilities, company_info } = req.body;
-  
+
   const proposal = {
     company: company_info || {
       name: "Remora Development LLC",
@@ -436,11 +466,18 @@ app.post("/rfp/generate", (req, res) => {
   
   const proposalPath = join(REPORTS_DIR, `proposal_${rfp_data?.solicitation_number || "draft"}_${Date.now()}.json`);
   writeFileSync(proposalPath, JSON.stringify(proposal, null, 2));
-  
-  res.json(proposal);
+
+  const ledgerEntry = store.appendLedgerEntry({
+    client_id: req.client.id,
+    engine: "rfp",
+    description: `Proposal drafting fee for ${rfp_data?.solicitation_number || "draft solicitation"}`,
+    amount: RFP_FLAT_FEE,
+  });
+
+  res.json({ ...proposal, ledger_entry: ledgerEntry });
 });
 
-app.get("/rfp/capabilities", (req, res) => {
+app.get("/rfp/capabilities", apiKeyAuth, (req, res) => {
   res.json({ capabilities: CAPABILITIES });
 });
 
@@ -448,29 +485,141 @@ app.get("/rfp/capabilities", (req, res) => {
 // LEAD ENRICHMENT (calls Base44)
 // ============================================
 
-app.post("/leads/enrich", async (req, res) => {
-  const { company_name, city } = req.body;
-  if (!company_name) return res.status(400).json({ error: "company_name required" });
-  
-  // Try to find the company website via search
-  try {
-    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(company_name + " " + (city || ""))}`;
-    const response = await fetch(searchUrl, {
-      headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" },
+const USER_AGENTS = [
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+];
+
+function extractEmails(html) {
+  const emailMatches = html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+  return [...new Set(emailMatches.filter(e =>
+    !e.includes("google.") && !e.includes("facebook.") && !e.includes("sentry.") &&
+    !e.match(/\.(png|jpg|css|js|woff)/) && !e.match(/^[0-9a-f]{8,}@/)
+  ))];
+}
+
+function looksBlocked(status, html) {
+  if (status === 429 || status === 503) return true;
+  const lower = html.toLowerCase();
+  return lower.includes("detected unusual traffic") || lower.includes("recaptcha") || lower.includes("/sorry/index");
+}
+
+// Raw Google-search scrape as a last resort. Datacenter IPs (like Render's)
+// get CAPTCHA'd frequently — this is why SERPAPI_KEY is preferred when set.
+async function scrapeGoogle(query) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+    const response = await fetch(`https://www.google.com/search?q=${encodeURIComponent(query)}`, {
+      headers: { "User-Agent": ua },
       signal: AbortSignal.timeout(10000),
     });
     const html = await response.text();
-    
-    // Extract emails from results
-    const emailMatches = html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
-    const validEmails = emailMatches.filter(e => 
-      !e.includes("google.") && !e.includes("facebook.") && !e.includes("sentry.") &&
-      !e.match(/\.(png|jpg|css|js|woff)/) && !e.match(/^[0-9a-f]{8,}@/)
-    );
-    
-    res.json({ company_name, city, emails_found: [...new Set(validEmails)].slice(0, 3) });
+    if (looksBlocked(response.status, html)) {
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+      return { blocked: true, emails: [] };
+    }
+    return { blocked: false, emails: extractEmails(html) };
+  }
+  return { blocked: true, emails: [] };
+}
+
+async function searchViaSerpApi(query) {
+  const url = `https://serpapi.com/search.json?q=${encodeURIComponent(query)}&api_key=${process.env.SERPAPI_KEY}`;
+  const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
+  if (!response.ok) throw new Error(`SerpAPI returned ${response.status}`);
+  const data = await response.json();
+  const html = JSON.stringify(data);
+  return { blocked: false, emails: extractEmails(html) };
+}
+
+app.post("/leads/enrich", apiKeyAuth, async (req, res) => {
+  const { company_name, city } = req.body;
+  if (!company_name) return res.status(400).json({ error: "company_name required" });
+
+  const query = `${company_name} ${city || ""}`.trim();
+  try {
+    const result = process.env.SERPAPI_KEY
+      ? await searchViaSerpApi(query)
+      : await scrapeGoogle(query);
+
+    if (result.blocked) {
+      return res.json({
+        company_name, city, emails_found: [], blocked: true,
+        note: "Search provider blocked/rate-limited this request. Set SERPAPI_KEY for reliable results.",
+      });
+    }
+
+    const emails = result.emails.slice(0, 3);
+    let ledgerEntry = null;
+    if (emails.length) {
+      ledgerEntry = store.appendLedgerEntry({
+        client_id: req.client.id,
+        engine: "leads",
+        description: `Lead enrichment for ${company_name}${city ? ", " + city : ""} (${emails.length} email${emails.length > 1 ? "s" : ""})`,
+        amount: parseFloat((LEAD_PRICE * emails.length).toFixed(2)),
+      });
+    }
+
+    res.json({ company_name, city, emails_found: emails, blocked: false, ledger_entry: ledgerEntry });
   } catch (err) {
-    res.json({ company_name, city, emails_found: [], error: err.message });
+    res.status(502).json({ company_name, city, emails_found: [], blocked: false, error: err.message });
+  }
+});
+
+// ============================================
+// ADMIN — clients & billing
+// ============================================
+
+app.post("/admin/clients", requireAdmin, (req, res) => {
+  const { name, email } = req.body;
+  if (!name) return res.status(400).json({ error: "name required" });
+  const client = store.createClient({ name, email });
+  res.json(client);
+});
+
+app.get("/admin/clients", requireAdmin, (req, res) => {
+  res.json({ clients: store.listClients() });
+});
+
+app.get("/billing/ledger", requireAdmin, (req, res) => {
+  const { client_id, invoiced } = req.query;
+  let entries = store.readLedger();
+  if (client_id) entries = entries.filter((e) => e.client_id === client_id);
+  if (invoiced === "false") entries = entries.filter((e) => !e.invoiced);
+  if (invoiced === "true") entries = entries.filter((e) => e.invoiced);
+  const total_pending = entries.filter((e) => !e.invoiced).reduce((s, e) => s + e.amount, 0);
+  res.json({ entries, total_pending: parseFloat(total_pending.toFixed(2)) });
+});
+
+app.post("/billing/invoice", requireAdmin, async (req, res) => {
+  const { client_id, ledger_ids } = req.body;
+  if (!client_id) return res.status(400).json({ error: "client_id required" });
+
+  const client = store.getClient(client_id);
+  if (!client) return res.status(404).json({ error: "client not found" });
+
+  const allEntries = store.readLedger().filter((e) => e.client_id === client_id && !e.invoiced);
+  const entries = ledger_ids?.length ? allEntries.filter((e) => ledger_ids.includes(e.id)) : allEntries;
+
+  if (!entries.length) return res.status(400).json({ error: "no pending ledger entries for this client" });
+
+  if (!isStripeConfigured()) {
+    return res.status(503).json({
+      error: "Stripe not configured — set STRIPE_SECRET_KEY to send real invoices",
+      would_invoice: entries,
+      total: parseFloat(entries.reduce((s, e) => s + e.amount, 0).toFixed(2)),
+    });
+  }
+
+  try {
+    const invoice = await invoiceLedgerEntries(store, client, entries);
+    res.json({ invoiced: entries.length, stripe_invoice_id: invoice.id, hosted_invoice_url: invoice.hosted_invoice_url });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
   }
 });
 

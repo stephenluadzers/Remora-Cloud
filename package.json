@@ -8,6 +8,7 @@
     "start": "node src/unified-server.js"
   },
   "dependencies": {
-    "express": "^4.22.2"
+    "express": "^4.22.2",
+    "stripe": "^22.3.2"
   }
 }
