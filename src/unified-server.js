@@ -17,6 +17,7 @@ import { createRequire } from "node:module";
 import { initStore } from "./store.js";
 import { requireApiKey, requireAdmin } from "./auth.js";
 import { isStripeConfigured, invoiceLedgerEntries } from "./billing.js";
+import { startOpportunityFinder, readOpportunities } from "./opportunity-finder.js";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -445,10 +446,8 @@ app.post("/rfp/parse", apiKeyAuth, (req, res) => {
   res.json(parsed);
 });
 
-app.post("/rfp/generate", apiKeyAuth, (req, res) => {
-  const { rfp_data, capabilities, company_info } = req.body;
-
-  const proposal = {
+function draftProposal(rfp_data, company_info) {
+  return {
     company: company_info || {
       name: "Remora Development LLC",
       uei: "CU97CJ3VGJU6",
@@ -463,7 +462,12 @@ app.post("/rfp/generate", apiKeyAuth, (req, res) => {
     },
     generated_at: new Date().toISOString(),
   };
-  
+}
+
+app.post("/rfp/generate", apiKeyAuth, (req, res) => {
+  const { rfp_data, company_info } = req.body;
+  const proposal = draftProposal(rfp_data, company_info);
+
   const proposalPath = join(REPORTS_DIR, `proposal_${rfp_data?.solicitation_number || "draft"}_${Date.now()}.json`);
   writeFileSync(proposalPath, JSON.stringify(proposal, null, 2));
 
@@ -479,6 +483,13 @@ app.post("/rfp/generate", apiKeyAuth, (req, res) => {
 
 app.get("/rfp/capabilities", apiKeyAuth, (req, res) => {
   res.json({ capabilities: CAPABILITIES });
+});
+
+// Opportunities the autonomous SAM.gov poller has found (see opportunity-finder.js).
+app.get("/rfp/opportunities", apiKeyAuth, (req, res) => {
+  const onlyDrafted = req.query.drafted === "true";
+  const opportunities = readOpportunities(DATA_DIR, { onlyDrafted });
+  res.json({ count: opportunities.length, opportunities });
 });
 
 // ============================================
@@ -622,6 +633,8 @@ app.post("/billing/invoice", requireAdmin, async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+startOpportunityFinder({ dataDir: DATA_DIR, reportsDir: REPORTS_DIR, matchCapabilities, draftProposal });
 
 // ============================================
 // START

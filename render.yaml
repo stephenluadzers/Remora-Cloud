@@ -19,6 +19,12 @@ services:
         sync: false
       - key: SERPAPI_KEY
         sync: false
+      - key: SAM_GOV_API_KEY
+        sync: false
+      - key: SAM_GOV_KEYWORDS
+        sync: false
+      - key: SAM_POLL_INTERVAL_HOURS
+        value: "6"
       - key: PARCEL_CONTINGENCY_RATE
         value: "0.20"
       - key: RFP_FLAT_FEE

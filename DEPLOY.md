@@ -66,6 +66,34 @@ requires an `x-api-key` header tied to a client. `/health` stays open.
   reliable lead enrichment (the response's `blocked: true` flag tells you
   when the raw scrape got blocked).
 
+### Fastest path to just using it yourself
+Set `ADMIN_KEY` on Render, then call any engine with that same value as
+`x-api-key` — no need to create a client first. `/admin/*` and `/billing/*`
+still require it as `x-admin-key`. Only bother with `/admin/clients` once you
+have an actual paying client to issue a separate key to.
+
+### Autonomous opportunity finding (RFP engine)
+The RFP engine used to be purely reactive — nothing looked for contracts on
+its own. Set `SAM_GOV_API_KEY` (free, self-service at
+https://sam.gov/data-services -> Request Public API Key) and the server will
+poll SAM.gov every `SAM_POLL_INTERVAL_HOURS` (default 6) for new
+opportunities matching `SAM_GOV_KEYWORDS` (comma-separated, defaults to
+Remora's capability list), auto-draft a proposal for anything that matches,
+and save it. Check what it's found:
+
+```bash
+curl "https://remora-cloud.onrender.com/rfp/opportunities?drafted=true" \
+  -H "x-api-key: $ADMIN_KEY"
+```
+
+Without `SAM_GOV_API_KEY` set, this stays off and logs a message saying so
+at boot — everything else works normally either way.
+
+Freight brokerage and parcel auditing can't do the same kind of unprompted
+"go find it" search: freight matching needs a paid load-board feed you don't
+have yet, and parcel auditing needs a client's own invoice data. Those stay
+on-demand until you plug in a data source or land a client.
+
 ### Creating a client
 ```bash
 curl -X POST https://remora-cloud.onrender.com/admin/clients \
