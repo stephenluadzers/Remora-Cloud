@@ -18,7 +18,12 @@ import { createRequire } from "node:module";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const DATA_DIR = process.env.DATA_DIR || "/data";
+let DATA_DIR = process.env.DATA_DIR || "/data";
+try {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+} catch {
+  DATA_DIR = join(process.cwd(), "data");
+}
 const QUEUE_DIR = join(DATA_DIR, "queue");
 const REPORTS_DIR = join(DATA_DIR, "reports");
 [QUEUE_DIR, REPORTS_DIR].forEach((d) => { if (!existsSync(d)) mkdirSync(d, { recursive: true }); });
