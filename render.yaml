@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: remora-cloud
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    disk:
+      name: remora-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: ADMIN_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: SERPAPI_KEY
+        sync: false
+      - key: SAM_GOV_API_KEY
+        sync: false
+      - key: SAM_GOV_KEYWORDS
+        sync: false
+      - key: SAM_POLL_INTERVAL_HOURS
+        value: "6"
+      - key: PARCEL_CONTINGENCY_RATE
+        value: "0.20"
+      - key: RFP_FLAT_FEE
+        value: "500"
+      - key: LEAD_PRICE
+        value: "2"

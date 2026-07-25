@@ -49,3 +49,75 @@ POST /leads/enrich — { company_name, city }
 ## Cost
 $7/month (Render Starter plan)
 Runs 24/7 — your Mac can be off.
+
+## Auth & Billing
+
+Every engine route (`/parcel/*`, `/freight/*`, `/rfp/*`, `/leads/*`) now
+requires an `x-api-key` header tied to a client. `/health` stays open.
+
+### Required env vars
+- `ADMIN_KEY` — required to use any `/admin/*` or `/billing/*` route. Without
+  it, those routes are disabled (fail closed).
+- `STRIPE_SECRET_KEY` — optional. Without it, engines still work and the
+  billing ledger still tracks what's owed, but `/billing/invoice` returns
+  what it *would* invoice instead of actually charging.
+- `SERPAPI_KEY` — optional. Without it, `/leads/enrich` scrapes Google
+  directly, which datacenter IPs get CAPTCHA'd on fairly often. Set this for
+  reliable lead enrichment (the response's `blocked: true` flag tells you
+  when the raw scrape got blocked).
+
+### Fastest path to just using it yourself
+Set `ADMIN_KEY` on Render, then call any engine with that same value as
+`x-api-key` — no need to create a client first. `/admin/*` and `/billing/*`
+still require it as `x-admin-key`. Only bother with `/admin/clients` once you
+have an actual paying client to issue a separate key to.
+
+### Autonomous opportunity finding (RFP engine)
+The RFP engine used to be purely reactive — nothing looked for contracts on
+its own. Set `SAM_GOV_API_KEY` (free, self-service at
+https://sam.gov/data-services -> Request Public API Key) and the server will
+poll SAM.gov every `SAM_POLL_INTERVAL_HOURS` (default 6) for new
+opportunities matching `SAM_GOV_KEYWORDS` (comma-separated, defaults to
+Remora's capability list), auto-draft a proposal for anything that matches,
+and save it. Check what it's found:
+
+```bash
+curl "https://remora-cloud.onrender.com/rfp/opportunities?drafted=true" \
+  -H "x-api-key: $ADMIN_KEY"
+```
+
+Without `SAM_GOV_API_KEY` set, this stays off and logs a message saying so
+at boot — everything else works normally either way.
+
+Freight brokerage and parcel auditing can't do the same kind of unprompted
+"go find it" search: freight matching needs a paid load-board feed you don't
+have yet, and parcel auditing needs a client's own invoice data. Those stay
+on-demand until you plug in a data source or land a client.
+
+### Creating a client
+```bash
+curl -X POST https://remora-cloud.onrender.com/admin/clients \
+  -H "x-admin-key: $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"name":"Acme Shipping","email":"ops@acme.com"}'
+# => { id, name, email, api_key, ... }  -- give the client's api_key to whatever calls the engines for them
+```
+
+### How billing works
+Billable engine calls (a generated parcel claim, a confirmed freight match,
+a generated RFP proposal, a successful lead enrichment) append a pending
+entry to a ledger — nothing is charged automatically, since e.g. a parcel
+refund contingency fee is only actually owed once the carrier pays out.
+
+```bash
+# see what's owed by a client
+curl "https://remora-cloud.onrender.com/billing/ledger?client_id=$CLIENT_ID&invoiced=false" \
+  -H "x-admin-key: $ADMIN_KEY"
+
+# invoice all pending entries for a client via Stripe (requires STRIPE_SECRET_KEY)
+curl -X POST https://remora-cloud.onrender.com/billing/invoice \
+  -H "x-admin-key: $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d "{\"client_id\":\"$CLIENT_ID\"}"
+```
+
+Pricing knobs (`PARCEL_CONTINGENCY_RATE`, `RFP_FLAT_FEE`, `LEAD_PRICE`) are
+env vars — see `render.yaml`.
